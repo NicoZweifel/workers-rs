@@ -1,16 +1,18 @@
 use std::{
+    convert::TryFrom,
     io::ErrorKind,
     pin::Pin,
     task::{Context, Poll},
 };
 
-use crate::r2::js_object;
 use crate::Result;
+use crate::{r2::js_object, Error};
 use futures_util::FutureExt;
 use js_sys::{
     Boolean as JsBoolean, Error as JsError, JsString, Number as JsNumber, Object as JsObject,
     Reflect, Uint8Array,
 };
+use std::convert::TryInto;
 use std::io::Error as IoError;
 use std::io::Result as IoResult;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -20,38 +22,45 @@ use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WritableStream, WritableStreamDefaultWriter,
 };
 
+#[derive(Debug)]
+pub struct SocketInfo {
+    pub remote_address: Option<String>,
+    pub local_address: Option<String>,
+}
+
+impl TryFrom<JsValue> for SocketInfo {
+    type Error = Error;
+    fn try_from(value: JsValue) -> Result<Self> {
+        let remote_address_value =
+            js_sys::Reflect::get(&value, &JsValue::from_str("remoteAddress"))?;
+        let local_address_value = js_sys::Reflect::get(&value, &JsValue::from_str("localAddress"))?;
+        Ok(Self {
+            remote_address: remote_address_value.as_string(),
+            local_address: local_address_value.as_string(),
+        })
+    }
+}
+
+#[derive(Default)]
 enum Reading {
+    #[default]
     None,
     Pending(JsFuture, ReadableStreamDefaultReader),
     Ready(Vec<u8>),
 }
 
-impl Default for Reading {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
+#[derive(Default)]
 enum Writing {
     Pending(JsFuture, WritableStreamDefaultWriter, usize),
+    #[default]
     None,
 }
 
-impl Default for Writing {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
+#[derive(Default)]
 enum Closing {
     Pending(JsFuture),
+    #[default]
     None,
-}
-
-impl Default for Closing {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Represents an outbound TCP connection from your Worker.
@@ -70,8 +79,8 @@ unsafe impl Sync for Socket {}
 
 impl Socket {
     fn new(inner: worker_sys::Socket) -> Self {
-        let writable = inner.writable();
-        let readable = inner.readable();
+        let writable = inner.writable().unwrap();
+        let readable = inner.readable().unwrap();
         Socket {
             inner,
             writable,
@@ -84,15 +93,20 @@ impl Socket {
 
     /// Closes the TCP socket. Both the readable and writable streams are forcibly closed.
     pub async fn close(&mut self) -> Result<()> {
-        JsFuture::from(self.inner.close()).await?;
+        JsFuture::from(self.inner.close()?).await?;
         Ok(())
     }
 
     /// This Future is resolved when the socket is closed
     /// and is rejected if the socket encounters an error.
     pub async fn closed(&self) -> Result<()> {
-        JsFuture::from(self.inner.closed()).await?;
+        JsFuture::from(self.inner.closed()?).await?;
         Ok(())
+    }
+
+    pub async fn opened(&self) -> Result<SocketInfo> {
+        let value = JsFuture::from(self.inner.opened()?).await?;
+        value.try_into()
     }
 
     /// Upgrades an insecure socket to a secure one that uses TLS,
@@ -101,7 +115,7 @@ impl Socket {
     /// to [`StartTls`](SecureTransport::StartTls) when initially
     /// calling [`connect`](connect) to create the socket.
     pub fn start_tls(self) -> Socket {
-        let inner = self.inner.start_tls();
+        let inner = self.inner.start_tls().unwrap();
         Socket::new(inner)
     }
 
@@ -359,7 +373,7 @@ impl ConnectionBuilder {
         )
         .into();
 
-        let inner = worker_sys::connect(address, options);
+        let inner = worker_sys::connect(address, options)?;
         Ok(Socket::new(inner))
     }
 }

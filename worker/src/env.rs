@@ -12,8 +12,12 @@ use worker_kv::KvStore;
 #[wasm_bindgen]
 extern "C" {
     /// Env contains any bindings you have associated with the Worker when you uploaded it.
+    #[derive(Clone)]
     pub type Env;
 }
+
+unsafe impl Send for Env {}
+unsafe impl Sync for Env {}
 
 impl Env {
     /// Access a binding that does not have a wrapper in workers-rs. Useful for internal-only or
@@ -144,6 +148,7 @@ impl ToString for StringBinding {
 }
 
 /// A string value representing a binding to a secret in a Worker.
-pub type Secret = StringBinding;
+#[doc(inline)]
+pub use StringBinding as Secret;
 /// A string value representing a binding to an environment variable in a Worker.
 pub type Var = StringBinding;

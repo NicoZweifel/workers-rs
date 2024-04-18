@@ -43,14 +43,14 @@ pub struct Stub {
 impl Stub {
     /// Send an internal Request to the Durable Object to which the stub points.
     pub async fn fetch_with_request(&self, req: Request) -> Result<Response> {
-        let promise = self.inner.fetch_with_request(req.inner());
+        let promise = self.inner.fetch_with_request(req.inner())?;
         let response = JsFuture::from(promise).await?;
         Ok(response.dyn_into::<web_sys::Response>()?.into())
     }
 
     /// Construct a Request from a URL to the Durable Object to which the stub points.
     pub async fn fetch_with_str(&self, url: &str) -> Result<Response> {
-        let promise = self.inner.fetch_with_str(url);
+        let promise = self.inner.fetch_with_str(url)?;
         let response = JsFuture::from(promise).await?;
         Ok(response.dyn_into::<web_sys::Response>()?.into())
     }
@@ -152,7 +152,7 @@ impl ObjectId<'_> {
 
 impl ToString for ObjectId<'_> {
     fn to_string(&self) -> String {
-        self.inner.to_string()
+        self.inner.to_string().unwrap()
     }
 }
 
@@ -167,7 +167,7 @@ impl State {
     /// method.
     pub fn id(&self) -> ObjectId<'_> {
         ObjectId {
-            inner: self.inner.id(),
+            inner: self.inner.id().unwrap(),
             namespace: None,
         }
     }
@@ -176,7 +176,7 @@ impl State {
     /// [Transactional Storage API](https://developers.cloudflare.com/workers/runtime-apis/durable-objects#transactional-storage-api) for a detailed reference.
     pub fn storage(&self) -> Storage {
         Storage {
-            inner: self.inner.storage(),
+            inner: self.inner.storage().unwrap(),
         }
     }
 
@@ -184,10 +184,12 @@ impl State {
     where
         F: Future<Output = ()> + 'static,
     {
-        self.inner.wait_until(&future_to_promise(async {
-            future.await;
-            Ok(JsValue::UNDEFINED)
-        }))
+        self.inner
+            .wait_until(&future_to_promise(async {
+                future.await;
+                Ok(JsValue::UNDEFINED)
+            }))
+            .unwrap()
     }
 
     // needs to be accessed by the `durable_object` macro in a conversion step
@@ -196,18 +198,21 @@ impl State {
     }
 
     pub fn accept_web_socket(&self, ws: &WebSocket) {
-        self.inner.accept_websocket(ws.as_ref())
+        self.inner.accept_websocket(ws.as_ref()).unwrap()
     }
 
     pub fn accept_websocket_with_tags(&self, ws: &WebSocket, tags: &[&str]) {
         let tags = tags.iter().map(|it| (*it).into()).collect();
 
-        self.inner.accept_websocket_with_tags(ws.as_ref(), tags);
+        self.inner
+            .accept_websocket_with_tags(ws.as_ref(), tags)
+            .unwrap();
     }
 
     pub fn get_websockets(&self) -> Vec<WebSocket> {
         self.inner
             .get_websockets()
+            .unwrap()
             .into_iter()
             .map(Into::into)
             .collect()
@@ -216,9 +221,15 @@ impl State {
     pub fn get_websockets_with_tag(&self, tag: &str) -> Vec<WebSocket> {
         self.inner
             .get_websockets_with_tag(tag)
+            .unwrap()
             .into_iter()
             .map(Into::into)
             .collect()
+    }
+
+    /// Retrieve tags from a hibernatable websocket
+    pub fn get_tags(&self, websocket: &WebSocket) -> Vec<String> {
+        self.inner.get_tags(websocket.as_ref()).unwrap()
     }
 }
 
@@ -437,36 +448,34 @@ impl Storage {
         fut.await.map(|_| ()).map_err(Error::from)
     }
 
-    // TODO(nilslice): follow up with runtime team on transaction API in general
-    // This function doesn't work on stable yet because the wasm_bindgen `Closure` type is still nightly-gated
-    // #[allow(dead_code)]
-    // async fn transaction<F>(&mut self, closure: fn(Transaction) -> F) -> Result<()>
-    // where
-    //     F: Future<Output = Result<()>> + 'static,
-    // {
-    //     let mut clos = |t: Transaction| {
-    //         future_to_promise(async move {
-    //             closure(t)
-    //                 .await
-    //                 .map_err(JsValue::from)
-    //                 .map(|_| JsValue::NULL)
-    //         })
-    //     };
-    //     JsFuture::from(self.inner.transaction_internal(&mut clos)?)
-    //         .await
-    //         .map_err(Error::from)
-    //         .map(|_| ())
-    // }
+    pub async fn transaction<F, Fut>(&mut self, mut closure: F) -> Result<()>
+    where
+        F: FnMut(Transaction) -> Fut + Copy + 'static,
+        Fut: Future<Output = Result<()>> + 'static,
+    {
+        let inner: Box<dyn FnMut(DurableObjectTransaction) -> js_sys::Promise> =
+            Box::new(move |t: DurableObjectTransaction| -> js_sys::Promise {
+                future_to_promise(async move {
+                    closure(Transaction { inner: t })
+                        .await
+                        .map_err(JsValue::from)
+                        .map(|_| JsValue::NULL)
+                })
+            });
+        let clos = wasm_bindgen::closure::Closure::wrap(inner);
+        JsFuture::from(self.inner.transaction(&clos)?)
+            .await
+            .map_err(Error::from)
+            .map(|_| ())
+    }
 }
 
-#[allow(dead_code)]
-struct Transaction {
+pub struct Transaction {
     inner: DurableObjectTransaction,
 }
 
-#[allow(dead_code)]
 impl Transaction {
-    async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<T> {
+    pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<T> {
         JsFuture::from(self.inner.get(key)?)
             .await
             .and_then(|val| {
@@ -479,7 +488,7 @@ impl Transaction {
             .map_err(Error::from)
     }
 
-    async fn get_multiple(&self, keys: Vec<impl Deref<Target = str>>) -> Result<Map> {
+    pub async fn get_multiple(&self, keys: Vec<impl Deref<Target = str>>) -> Result<Map> {
         let keys = self.inner.get_multiple(
             keys.into_iter()
                 .map(|key| JsValue::from(key.deref()))
@@ -489,7 +498,7 @@ impl Transaction {
         keys.dyn_into::<Map>().map_err(Error::from)
     }
 
-    async fn put<T: Serialize>(&mut self, key: &str, value: T) -> Result<()> {
+    pub async fn put<T: Serialize>(&mut self, key: &str, value: T) -> Result<()> {
         JsFuture::from(self.inner.put(key, serde_wasm_bindgen::to_value(&value)?)?)
             .await
             .map_err(Error::from)
@@ -497,7 +506,7 @@ impl Transaction {
     }
 
     // Each key-value pair in the serialized object will be added to the storage
-    async fn put_multiple<T: Serialize>(&mut self, values: T) -> Result<()> {
+    pub async fn put_multiple<T: Serialize>(&mut self, values: T) -> Result<()> {
         let values = serde_wasm_bindgen::to_value(&values)?;
         if !values.is_object() {
             return Err("Must pass in a struct type".to_string().into());
@@ -508,7 +517,7 @@ impl Transaction {
             .map(|_| ())
     }
 
-    async fn delete(&mut self, key: &str) -> Result<bool> {
+    pub async fn delete(&mut self, key: &str) -> Result<bool> {
         let fut: JsFuture = self.inner.delete(key)?.into();
         fut.await
             .and_then(|jsv| {
@@ -518,7 +527,7 @@ impl Transaction {
             .map_err(Error::from)
     }
 
-    async fn delete_multiple(&mut self, keys: Vec<impl Deref<Target = str>>) -> Result<usize> {
+    pub async fn delete_multiple(&mut self, keys: Vec<impl Deref<Target = str>>) -> Result<usize> {
         let fut: JsFuture = self
             .inner
             .delete_multiple(
@@ -536,19 +545,19 @@ impl Transaction {
             .map_err(Error::from)
     }
 
-    async fn delete_all(&mut self) -> Result<()> {
+    pub async fn delete_all(&mut self) -> Result<()> {
         let fut: JsFuture = self.inner.delete_all()?.into();
         fut.await.map(|_| ()).map_err(Error::from)
     }
 
-    async fn list(&self) -> Result<Map> {
+    pub async fn list(&self) -> Result<Map> {
         let fut: JsFuture = self.inner.list()?.into();
         fut.await
             .and_then(|jsv| jsv.dyn_into())
             .map_err(Error::from)
     }
 
-    async fn list_with_options(&self, opts: ListOptions<'_>) -> Result<Map> {
+    pub async fn list_with_options(&self, opts: ListOptions<'_>) -> Result<Map> {
         let fut: JsFuture = self
             .inner
             .list_with_options(serde_wasm_bindgen::to_value(&opts)?.into())?
@@ -558,7 +567,7 @@ impl Transaction {
             .map_err(Error::from)
     }
 
-    fn rollback(&mut self) -> Result<()> {
+    pub fn rollback(&mut self) -> Result<()> {
         self.inner.rollback().map_err(Error::from)
     }
 }

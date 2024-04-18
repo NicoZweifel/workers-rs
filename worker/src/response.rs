@@ -5,9 +5,13 @@ use crate::ByteStream;
 use crate::Result;
 use crate::WebSocket;
 
+#[cfg(feature = "http")]
+use bytes::Bytes;
 use futures_util::{TryStream, TryStreamExt};
 use js_sys::Uint8Array;
 use serde::{de::DeserializeOwned, Serialize};
+#[cfg(feature = "http")]
+use std::convert::TryFrom;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::ReadableStream;
@@ -30,6 +34,24 @@ pub struct Response {
     headers: Headers,
     status_code: u16,
     websocket: Option<WebSocket>,
+}
+
+#[cfg(feature = "http")]
+impl<B: http_body::Body<Data = Bytes> + 'static> TryFrom<http::Response<B>> for Response {
+    type Error = crate::Error;
+    fn try_from(res: http::Response<B>) -> Result<Self> {
+        let resp = crate::http::response::to_wasm(res)?;
+        Ok(resp.into())
+    }
+}
+
+#[cfg(feature = "http")]
+impl TryFrom<Response> for crate::HttpResponse {
+    type Error = crate::Error;
+    fn try_from(res: Response) -> Result<crate::HttpResponse> {
+        let sys_resp: web_sys::Response = res.into();
+        crate::http::response::from_wasm(sys_resp)
+    }
 }
 
 impl Response {

@@ -1,5 +1,7 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::iter::{once, Once};
+use std::ops::Deref;
 use std::result::Result as StdResult;
 
 use js_sys::Array;
@@ -25,15 +27,18 @@ pub mod macros;
 // A D1 Database.
 pub struct D1Database(D1DatabaseSys);
 
+unsafe impl Sync for D1Database {}
+unsafe impl Send for D1Database {}
+
 impl D1Database {
     /// Prepare a query statement from a query string.
     pub fn prepare<T: Into<String>>(&self, query: T) -> D1PreparedStatement {
-        self.0.prepare(&query.into()).into()
+        self.0.prepare(&query.into()).unwrap().into()
     }
 
     /// Dump the data in the database to a `Vec`.
     pub async fn dump(&self) -> Result<Vec<u8>> {
-        let result = JsFuture::from(self.0.dump()).await;
+        let result = JsFuture::from(self.0.dump()?).await;
         let array_buffer = cast_to_d1_error(result)?;
         let array_buffer = array_buffer.dyn_into::<ArrayBuffer>()?;
         let array = Uint8Array::new(&array_buffer);
@@ -45,7 +50,7 @@ impl D1Database {
     /// Returns the results in the same order as the provided statements.
     pub async fn batch(&self, statements: Vec<D1PreparedStatement>) -> Result<Vec<D1Result>> {
         let statements = statements.into_iter().map(|s| s.0).collect::<Array>();
-        let results = JsFuture::from(self.0.batch(statements)).await;
+        let results = JsFuture::from(self.0.batch(statements)?).await;
         let results = cast_to_d1_error(results)?;
         let results = results.dyn_into::<Array>()?;
         let mut vec = Vec::with_capacity(results.length() as usize);
@@ -69,7 +74,7 @@ impl D1Database {
     /// If an error occurs, an exception is thrown with the query and error
     /// messages, execution stops and further statements are not executed.
     pub async fn exec(&self, query: &str) -> Result<D1ExecResult> {
-        let result = JsFuture::from(self.0.exec(query)).await;
+        let result = JsFuture::from(self.0.exec(query)?).await;
         let result = cast_to_d1_error(result)?;
         Ok(result.into())
     }
@@ -127,6 +132,93 @@ impl From<D1DatabaseSys> for D1Database {
     }
 }
 
+/// Possible argument types that can be bound to [`D1PreparedStatement`]
+/// See https://developers.cloudflare.com/d1/build-with-d1/d1-client-api/#type-conversion
+pub enum D1Type<'a> {
+    Null,
+    Real(f64),
+    // I believe JS always casts to float. Documentation states it can accept up to 53 bits of signed precision
+    // so I went with i32 here. https://developer.mozilla.org/en-US/docs/Web/JavaScript/Data_structures#number_type
+    // D1 does not support `BigInt`
+    Integer(i32),
+    Text(&'a str),
+    Boolean(bool),
+    Blob(&'a [u8]),
+}
+
+/// A pre-computed argument for `bind_refs`.
+///
+/// Arguments must be converted to `JsValue` when bound. If you plan to
+/// re-use the same argument multiple times, consider using a `D1PreparedArgument`
+/// which does this once on construction.
+pub struct D1PreparedArgument<'a> {
+    value: &'a D1Type<'a>,
+    js_value: JsValue,
+}
+
+impl<'a> D1PreparedArgument<'a> {
+    pub fn new(value: &'a D1Type) -> D1PreparedArgument<'a> {
+        Self {
+            value,
+            js_value: value.into(),
+        }
+    }
+}
+
+impl<'a> From<&'a D1Type<'a>> for JsValue {
+    fn from(value: &'a D1Type<'a>) -> Self {
+        match *value {
+            D1Type::Null => JsValue::null(),
+            D1Type::Real(f) => JsValue::from_f64(f),
+            D1Type::Integer(i) => JsValue::from_f64(i as f64),
+            D1Type::Text(s) => JsValue::from_str(s),
+            D1Type::Boolean(b) => JsValue::from_bool(b),
+            D1Type::Blob(a) => serde_wasm_bindgen::to_value(a).unwrap(),
+        }
+    }
+}
+
+impl<'a> Deref for D1PreparedArgument<'a> {
+    type Target = D1Type<'a>;
+    fn deref(&self) -> &Self::Target {
+        self.value
+    }
+}
+
+impl<'a> IntoIterator for &'a D1Type<'a> {
+    type Item = &'a D1Type<'a>;
+    type IntoIter = Once<&'a D1Type<'a>>;
+    /// Allows a single &D1Type to be passed to `bind_refs`, without placing it in an array.
+    fn into_iter(self) -> Self::IntoIter {
+        once(self)
+    }
+}
+
+impl<'a> IntoIterator for &'a D1PreparedArgument<'a> {
+    type Item = &'a D1PreparedArgument<'a>;
+    type IntoIter = Once<&'a D1PreparedArgument<'a>>;
+    /// Allows a single &D1PreparedArgument to be passed to `bind_refs`, without placing it in an array.
+    fn into_iter(self) -> Self::IntoIter {
+        once(self)
+    }
+}
+
+pub trait D1Argument {
+    fn js_value(&self) -> impl AsRef<JsValue>;
+}
+
+impl<'a> D1Argument for D1Type<'a> {
+    fn js_value(&self) -> impl AsRef<JsValue> {
+        Into::<JsValue>::into(self)
+    }
+}
+
+impl<'a> D1Argument for D1PreparedArgument<'a> {
+    fn js_value(&self) -> impl AsRef<JsValue> {
+        &self.js_value
+    }
+}
+
 // A D1 prepared query statement.
 #[derive(Clone)]
 pub struct D1PreparedStatement(D1PreparedStatementSys);
@@ -150,6 +242,35 @@ impl D1PreparedStatement {
         }
     }
 
+    /// Bind one or more parameters to the statement.
+    /// Returns a new statement with the bound parameters, leaving the old statement available for reuse.
+    pub fn bind_refs<'a, T, U: 'a>(&self, values: T) -> Result<Self>
+    where
+        T: IntoIterator<Item = &'a U>,
+        U: D1Argument,
+    {
+        let array: Array = values.into_iter().map(|t| t.js_value()).collect::<Array>();
+
+        match self.0.bind(array) {
+            Ok(stmt) => Ok(D1PreparedStatement(stmt)),
+            Err(err) => Err(Error::from(err)),
+        }
+    }
+
+    /// Bind a batch of parameter values, returning a batch of prepared statements.
+    /// Result can be passed to [`D1Database::batch`] to execute the statements.
+    pub fn batch_bind<'a, U: 'a, T: 'a, V: 'a>(&self, values: T) -> Result<Vec<Self>>
+    where
+        T: IntoIterator<Item = U>,
+        U: IntoIterator<Item = &'a V>,
+        V: D1Argument,
+    {
+        values
+            .into_iter()
+            .map(|batch| self.bind_refs(batch))
+            .collect()
+    }
+
     /// Return the first row of results.
     ///
     /// If `col_name` is `Some`, returns that single value, otherwise returns the entire object.
@@ -161,7 +282,7 @@ impl D1PreparedStatement {
     where
         T: for<'a> Deserialize<'a>,
     {
-        let result = JsFuture::from(self.0.first(col_name)).await;
+        let result = JsFuture::from(self.0.first(col_name)?).await;
         let js_value = cast_to_d1_error(result)?;
         let value = serde_wasm_bindgen::from_value(js_value)?;
         Ok(value)
@@ -169,14 +290,14 @@ impl D1PreparedStatement {
 
     /// Executes a query against the database but only return metadata.
     pub async fn run(&self) -> Result<D1Result> {
-        let result = JsFuture::from(self.0.run()).await;
+        let result = JsFuture::from(self.0.run()?).await;
         let result = cast_to_d1_error(result)?;
         Ok(D1Result(result.into()))
     }
 
     /// Executes a query against the database and returns all rows and metadata.
     pub async fn all(&self) -> Result<D1Result> {
-        let result = JsFuture::from(self.0.all()).await?;
+        let result = JsFuture::from(self.0.all()?).await?;
         Ok(D1Result(result.into()))
     }
 
@@ -185,7 +306,7 @@ impl D1PreparedStatement {
     where
         T: for<'a> Deserialize<'a>,
     {
-        let result = JsFuture::from(self.0.raw()).await;
+        let result = JsFuture::from(self.0.raw()?).await;
         let result = cast_to_d1_error(result)?;
         let result = result.dyn_into::<Array>()?;
         let mut vec = Vec::with_capacity(result.length() as usize);
@@ -194,6 +315,20 @@ impl D1PreparedStatement {
             vec.push(value);
         }
         Ok(vec)
+    }
+
+    /// Executes a query against the database and returns a `Vec` of JsValues.
+    pub async fn raw_js_value(&self) -> Result<Vec<JsValue>> {
+        let result = JsFuture::from(self.0.raw()?).await;
+        let result = cast_to_d1_error(result)?;
+        let array = result.dyn_into::<Array>()?;
+
+        Ok(array.to_vec())
+    }
+
+    /// Returns the inner JsValue bindings object.
+    pub fn inner(&self) -> &D1PreparedStatementSys {
+        &self.0
     }
 }
 
@@ -209,14 +344,14 @@ pub struct D1Result(D1ResultSys);
 impl D1Result {
     /// Returns `true` if the result indicates a success, otherwise `false`.
     pub fn success(&self) -> bool {
-        self.0.success()
+        self.0.success().unwrap()
     }
 
     /// Return the error contained in this result.
     ///
     /// Returns `None` if the result indicates a success.
     pub fn error(&self) -> Option<String> {
-        self.0.error()
+        self.0.error().unwrap()
     }
 
     /// Retrieve the collection of result objects, or an `Err` if an error occurred.
@@ -224,7 +359,7 @@ impl D1Result {
     where
         T: for<'a> Deserialize<'a>,
     {
-        if let Some(results) = self.0.results() {
+        if let Some(results) = self.0.results()? {
             let mut vec = Vec::with_capacity(results.length() as usize);
             for result in results.iter() {
                 let result = serde_wasm_bindgen::from_value(result).unwrap();
